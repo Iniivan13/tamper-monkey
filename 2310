@@ -1,0 +1,55 @@
+// ==UserScript==
+// @name         Akuivan Web Panel Persistent
+// @namespace    https://github.com/iniivan13
+// @version      1.3
+// @description  Auto inject Web Panel setiap load halaman dengan toggle on/off.
+// @match        *://*/*
+// @run-at       document-end
+// @grant        GM_registerMenuCommand
+// @noframes
+// ==/UserScript==
+
+(function () {
+    const PANEL_FLAG = '__akuivanWebPanelInjected';
+    const DISABLE_KEY = 'akuivan_panel_autoload_disabled';
+
+    function isDisabled() {
+        return localStorage.getItem(DISABLE_KEY) === 'true';
+    }
+
+    function injectPanel() {
+        if (window[PANEL_FLAG] || document.getElementById('web-panel-dev') || isDisabled()) {
+            return;
+        }
+
+        const s = document.createElement('script');
+        s.src = 'https://web-panel-ashen-three.vercel.app/web-panel.js?v=' + Date.now();
+        s.crossOrigin = 'anonymous';
+        s.onload = () => {
+            window[PANEL_FLAG] = true;
+        };
+        document.body.appendChild(s);
+    }
+
+    function setDisabled(value) {
+        localStorage.setItem(DISABLE_KEY, value ? 'true' : 'false');
+        alert('Akuivan Web Panel auto-load ' + (value ? 'dimatikan' : 'diaktifkan') + '. Reload halaman untuk menerapkan.');
+    }
+
+    if (typeof GM_registerMenuCommand === 'function') {
+        GM_registerMenuCommand(
+            isDisabled() ? 'Enable Akuivan Panel Auto Load' : 'Disable Akuivan Panel Auto Load',
+            () => setDisabled(!isDisabled())
+        );
+    }
+
+    if (window.top !== window.self) {
+        return;
+    }
+
+    if (document.readyState === 'loading') {
+        window.addEventListener('DOMContentLoaded', injectPanel, { once: true });
+    } else {
+        injectPanel();
+    }
+})();
