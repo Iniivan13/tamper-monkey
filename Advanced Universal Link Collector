@@ -1,0 +1,504 @@
+// ==UserScript==
+// @name         Advanced Universal Link Collector
+// @namespace    http://tampermonkey.net/
+// @version      0.2
+// @description  Collects all links from network requests, HTML source, and attributes — modern filterable panel
+// @author       akuivan
+// @match        *://*/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_registerMenuCommand
+// @grant        GM_setClipboard
+// @run-at       document-start
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const STORAGE_KEY = 'advancedCollectedLinks';
+    const MAX_LINKS = 5000;                 // cap stored links to keep storage sane
+
+    // Storage is a plain object (JSON-safe). Never store Set/Map in GM storage.
+    let allLinks = GM_getValue(STORAGE_KEY, {});
+    if (typeof allLinks !== 'object' || allLinks === null) allLinks = {};
+
+    let currentPageLinks = new Set();
+    let networkRequests = new Set();
+    let uiState = {filter: '', domain: '', sort: 'count', collapsed: false};
+
+    // ── URL validation ──────────────────────────────────────────────────────
+    const FALSE_POSITIVES = ['javascript:', 'mailto:', 'tel:', 'data:', 'about:', 'void(0)',
+        'undefined', 'null', 'function()', 'blob:'];
+    const STATIC_EXT = ['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.ico',
+        '.woff', '.woff2', '.ttf', '.eot', '.css', '.map'];
+
+    function isValidUrl(string) {
+        if (!string || typeof string !== 'string') return false;
+        const s = string.trim();
+        if (s.length < 5 || s.length > 500) return false;
+        if (s === '#' || s.startsWith('#')) return false;
+        if (FALSE_POSITIVES.some(fp => s.toLowerCase().includes(fp))) return false;
+        if (!s.includes('.') && !s.startsWith('/')) return false;
+        return /^(https?:)?\/\//i.test(s) || s.startsWith('/') || s.startsWith('./') || s.startsWith('../');
+    }
+
+    function isStaticAsset(url) {
+        try {
+            const p = new URL(url).pathname.toLowerCase();
+            return STATIC_EXT.some(ext => p.endsWith(ext));
+        } catch { return false; }
+    }
+
+    function toAbsoluteUrl(url, baseUrl = window.location.href) {
+        try {
+            let cleanUrl = String(url).trim().replace(/^['"`]|['"`]$/g, '');
+            cleanUrl = cleanUrl.replace(/&amp;/g, '&').replace(/&quot;/g, '"')
+                .replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+            if (cleanUrl.startsWith('http')) return new URL(cleanUrl).href;
+            if (cleanUrl.startsWith('//')) return new URL(window.location.protocol + cleanUrl).href;
+            return new URL(cleanUrl, baseUrl).href;
+        } catch { return null; }
+    }
+
+    function hostOf(url) { try { return new URL(url).hostname; } catch { return ''; } }
+
+    // ── Collectors ──────────────────────────────────────────────────────────
+    function setupNetworkMonitoring() {
+        if (!window.performance || !window.performance.getEntriesByType) return;
+
+        const ingest = (url) => {
+            if (!isValidUrl(url)) return;
+            const abs = toAbsoluteUrl(url);
+            if (abs) networkRequests.add(abs);
+        };
+
+        performance.getEntriesByType('resource').forEach(r => ingest(r.name));
+
+        const originalFetch = window.fetch;
+        if (typeof originalFetch === 'function') {
+            window.fetch = function (...args) {
+                try {
+                    const url = args[0];
+                    if (typeof url === 'string') ingest(url);
+                    else if (url && typeof url === 'object' && url.url) ingest(url.url);
+                } catch { /* never break page fetch */ }
+                return originalFetch.apply(this, args);
+            };
+        }
+
+        try {
+            const observer = new PerformanceObserver(list => list.getEntries().forEach(e => ingest(e.name)));
+            observer.observe({entryTypes: ['resource']});
+        } catch { /* unsupported */ }
+    }
+
+    function scanAttributes(root = document) {
+        const links = new Set();
+        const attrs = ['href', 'src', 'content', 'data-src', 'data-href', 'action', 'cite', 'poster', 'background'];
+        attrs.forEach(attr => {
+            root.querySelectorAll(`[${attr}]`).forEach(el => {
+                const v = el.getAttribute(attr);
+                if (v && isValidUrl(v)) { const abs = toAbsoluteUrl(v); if (abs) links.add(abs); }
+            });
+        });
+        root.querySelectorAll('[srcset]').forEach(el => {
+            const srcset = el.getAttribute('srcset');
+            if (!srcset) return;
+            srcset.split(',').forEach(part => {
+                const u = part.trim().split(/\s+/)[0];
+                if (u && isValidUrl(u)) { const abs = toAbsoluteUrl(u); if (abs) links.add(abs); }
+            });
+        });
+        return [...links];
+    }
+
+    function scanHtmlSource() {
+        const links = new Set();
+        const html = document.documentElement ? document.documentElement.outerHTML : '';
+        const patterns = [
+            /(?:href|src|content|data|action|url|service|endpoint)\s*=\s*["']([^"']+)["']/gi,
+            /["'](https?:\/\/[^"'\s<>(){}]+)["']/gi,
+            /["'](\/\/[^"'\s<>(){}]+\.[^"'\s<>(){}]+)["']/gi
+        ];
+        patterns.forEach(pattern => {
+            let m;
+            while ((m = pattern.exec(html)) !== null) {
+                const url = m[1] || m[0];
+                if (isValidUrl(url)) { const abs = toAbsoluteUrl(url); if (abs) links.add(abs); }
+            }
+        });
+        return [...links];
+    }
+
+    function extractAllLinks() {
+        const currentUrl = window.location.href;
+        const links = new Set();
+        [...scanAttributes(), ...scanHtmlSource(), ...networkRequests].forEach(link => {
+            if (link && isValidUrl(link)) links.add(link);
+        });
+
+        currentPageLinks = new Set();
+        let added = 0;
+        links.forEach(link => {
+            currentPageLinks.add(link);
+            const now = new Date().toISOString();
+            if (!allLinks[link]) {
+                if (Object.keys(allLinks).length >= MAX_LINKS) return;
+                allLinks[link] = {count: 0, firstSeen: now, lastSeen: now, pages: []};
+                added++;
+            }
+            const rec = allLinks[link];
+            rec.count = (rec.count || 0) + 1;
+            rec.lastSeen = now;
+            if (!Array.isArray(rec.pages)) rec.pages = [];
+            if (!rec.pages.includes(currentUrl) && rec.pages.length < 50) rec.pages.push(currentUrl);
+        });
+
+        GM_setValue(STORAGE_KEY, allLinks);
+        // Repaint only the list; a full renderPanel() rebuilds .alc-list and
+        // resets scrollTop, which makes the view jump to the top on every update.
+        if (added > 0 || currentPageLinks.size) {
+            if (document.getElementById(PANEL_ID)) { refreshStats(); renderList(); }
+            else renderPanel();
+        }
+    }
+
+    // ── Clipboard (GM_setClipboard may be sync OR promise — handle both) ─────
+    function copyText(text) {
+        try {
+            const r = GM_setClipboard(text, 'text');
+            if (r && typeof r.then === 'function') return r.then(() => true).catch(() => false);
+            return Promise.resolve(true);
+        } catch { return Promise.resolve(false); }
+    }
+
+    function currentList() {
+        return Object.keys(allLinks);
+    }
+
+    function filteredList() {
+        let list = currentList();
+        const f = uiState.filter.toLowerCase();
+        if (uiState.domain) list = list.filter(u => hostOf(u) === uiState.domain);
+        if (f) list = list.filter(u => u.toLowerCase().includes(f));
+        if (uiState.sort === 'alpha') list.sort();
+        else if (uiState.sort === 'recent') list.sort((a, b) => (allLinks[b].lastSeen || '').localeCompare(allLinks[a].lastSeen || ''));
+        else list.sort((a, b) => (allLinks[b].count || 0) - (allLinks[a].count || 0));
+        return list;
+    }
+
+    function domainCounts() {
+        const m = {};
+        currentList().forEach(u => { const h = hostOf(u); if (h) m[h] = (m[h] || 0) + 1; });
+        return Object.entries(m).sort((a, b) => b[1] - a[1]);
+    }
+
+    // ── UI ──────────────────────────────────────────────────────────────────
+    const PANEL_ID = 'advancedLinkCollectorUI';
+    const css = `
+        #${PANEL_ID} { position:fixed; top:12px; right:12px; width:400px; max-width:calc(100vw - 24px);
+            background:#0f1720; color:#e6edf5; border:1px solid #2a3a4d; border-radius:12px;
+            font:12px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; z-index:2147483646;
+            box-shadow:0 12px 40px #0007; display:flex; flex-direction:column; max-height:82vh; overflow:hidden; }
+        #${PANEL_ID} * { box-sizing:border-box; }
+        #${PANEL_ID} .alc-head { display:flex; align-items:center; gap:8px; padding:10px 12px; flex:0 0 auto;
+            background:#16212e; border-bottom:1px solid #2a3a4d; cursor:move; }
+        #${PANEL_ID} .alc-title { font-weight:700; font-size:13px; flex:1; }
+        #${PANEL_ID} .alc-icon { background:none; border:none; color:#9fb0c3; cursor:pointer; font-size:14px; padding:2px 6px; border-radius:6px; }
+        #${PANEL_ID} .alc-icon:hover { background:#22303f; color:#fff; }
+        #${PANEL_ID} .alc-stats { display:grid; grid-template-columns:1fr 1fr; gap:6px; padding:10px 12px 6px; }
+        #${PANEL_ID} .alc-stat { background:#16212e; border:1px solid #24313f; border-radius:8px; padding:6px 8px; }
+        #${PANEL_ID} .alc-stat b { display:block; font-size:16px; color:#38bdf8; }
+        #${PANEL_ID} .alc-stat span { color:#8fa1b3; font-size:10px; text-transform:uppercase; letter-spacing:.04em; }
+        #${PANEL_ID} .alc-controls { display:flex; gap:6px; padding:8px 12px; flex-wrap:wrap; }
+        #${PANEL_ID} input.alc-search { flex:1; min-width:120px; background:#0b1119; border:1px solid #2a3a4d;
+            color:#e6edf5; border-radius:8px; padding:6px 8px; font-size:12px; outline:none; }
+        #${PANEL_ID} select.alc-sel { background:#0b1119; border:1px solid #2a3a4d; color:#e6edf5; border-radius:8px; padding:6px; font-size:12px; }
+        #${PANEL_ID} .alc-btns { display:flex; gap:6px; padding:0 12px 8px; flex-wrap:wrap; }
+        #${PANEL_ID} .alc-btn { flex:1; min-width:88px; background:#1c2b3a; border:1px solid #2f4257; color:#dbe6f2;
+            border-radius:8px; padding:7px 8px; cursor:pointer; font-size:11px; font-weight:600; transition:background .15s; }
+        #${PANEL_ID} .alc-btn:hover { background:#26405a; }
+        #${PANEL_ID} .alc-btn.primary { background:#1e6f4a; border-color:#2b8f60; }
+        #${PANEL_ID} .alc-btn.primary:hover { background:#26845a; }
+        #${PANEL_ID} .alc-btn.danger { background:#5a2130; border-color:#7a2c40; }
+        #${PANEL_ID} .alc-btn.danger:hover { background:#6f293c; }
+        #${PANEL_ID} .alc-body { display:flex; flex-direction:column; flex:1 1 auto; min-height:0; overflow:hidden; }
+        #${PANEL_ID} .alc-list { overflow-y:auto; overflow-x:hidden; padding:0 12px 12px;
+            display:flex; flex-direction:column; gap:4px; flex:1 1 auto; min-height:120px;
+            scrollbar-width:thin; scrollbar-color:#38bdf8 #16212e; }
+        #${PANEL_ID} .alc-list::-webkit-scrollbar { width:10px; }
+        #${PANEL_ID} .alc-list::-webkit-scrollbar-track { background:#16212e; border-radius:0 0 12px 0; }
+        #${PANEL_ID} .alc-list::-webkit-scrollbar-thumb { background:#2f4257; border-radius:5px; border:2px solid #16212e; }
+        #${PANEL_ID} .alc-list::-webkit-scrollbar-thumb:hover { background:#38bdf8; }
+        #${PANEL_ID} .alc-row { display:flex; align-items:flex-start; gap:6px; background:#131d28; border:1px solid #22303f;
+            border-radius:7px; padding:6px 8px; }
+        #${PANEL_ID} .alc-row:hover { border-color:#38bdf8; }
+        #${PANEL_ID} .alc-url { flex:1; word-break:break-all; color:#cfe0f0; font-size:11px; }
+        #${PANEL_ID} .alc-badge { background:#22303f; color:#9fb0c3; border-radius:5px; padding:1px 6px; font-size:10px; white-space:nowrap; }
+        #${PANEL_ID} .alc-copy { background:none; border:none; color:#7d8ea3; cursor:pointer; font-size:12px; }
+        #${PANEL_ID} .alc-copy:hover { color:#38bdf8; }
+        #${PANEL_ID} .alc-empty { color:#7d8ea3; text-align:center; padding:18px; font-size:12px; }
+        #${PANEL_ID} .alc-foot { padding:6px 12px; border-top:1px solid #22303f; color:#6b7c8f; font-size:10px; display:flex; justify-content:space-between; }
+        #${PANEL_ID}.collapsed { max-height:44px; }
+        #${PANEL_ID}.collapsed .alc-body { display:none; }
+        .alc-toast { position:fixed; left:50%; bottom:32px; transform:translateX(-50%); background:#16212e;
+            color:#e6edf5; border:1px solid #2a3a4d; padding:9px 16px; border-radius:8px; z-index:2147483647;
+            font:12px system-ui,sans-serif; box-shadow:0 8px 24px #0006; }
+    `;
+
+    function ensureStyle() {
+        if (document.getElementById(PANEL_ID + '-style')) return;
+        const s = document.createElement('style');
+        s.id = PANEL_ID + '-style';
+        s.textContent = css;
+        (document.head || document.documentElement).appendChild(s);
+    }
+
+    function el(tag, cls, text) {
+        const e = document.createElement(tag);
+        if (cls) e.className = cls;
+        if (text != null) e.textContent = text;
+        return e;
+    }
+
+    function toast(msg) {
+        const t = el('div', 'alc-toast', msg);
+        (document.body || document.documentElement).appendChild(t);
+        setTimeout(() => t.remove(), 1800);
+    }
+
+    function copyAndToast(text, label) {
+        copyText(text).then(ok => toast(ok ? `Copied ${label}` : 'Copy failed'));
+    }
+
+    function renderPanel() {
+        if (!document.body) return;                     // run-at document-start guard
+        ensureStyle();
+
+        const list = filteredList();
+        const total = currentList().length;
+        const domains = domainCounts();
+
+        let panel = document.getElementById(PANEL_ID);
+        const firstRender = !panel;
+        if (firstRender) { panel = el('div'); panel.id = PANEL_ID; }
+
+        panel.classList.toggle('collapsed', uiState.collapsed);
+
+        // header
+        const head = el('div', 'alc-head');
+        head.appendChild(el('span', 'alc-title', '🔗 Link Collector'));
+        const collapseBtn = el('button', 'alc-icon', uiState.collapsed ? '▢' : '—');
+        collapseBtn.title = 'Collapse';
+        collapseBtn.onclick = () => { uiState.collapsed = !uiState.collapsed; renderPanel(); };
+        const closeBtn = el('button', 'alc-icon', '✕');
+        closeBtn.title = 'Hide (reload to restore)';
+        closeBtn.onclick = () => panel.style.display = 'none';
+        head.appendChild(collapseBtn); head.appendChild(closeBtn);
+
+        const body = el('div', 'alc-body');
+
+        // stats
+        const stats = el('div', 'alc-stats');
+        [['Total links', total], ['This page', currentPageLinks.size],
+         ['Network', networkRequests.size], ['Domains', domains.length]].forEach(([label, val]) => {
+            const s = el('div', 'alc-stat');
+            s.appendChild(el('b', null, String(val)));
+            s.appendChild(el('span', null, label));
+            stats.appendChild(s);
+        });
+
+        // controls
+        const controls = el('div', 'alc-controls');
+        const search = el('input', 'alc-search');
+        search.type = 'search'; search.placeholder = 'Filter URL…'; search.value = uiState.filter;
+        search.oninput = () => { uiState.filter = search.value; renderList(); };
+        const domSel = el('select', 'alc-sel');
+        [['', `All domains (${domains.length})`], ...domains.map(([d, c]) => [d, `${d} (${c})`])]
+            .forEach(([v, label]) => { const o = el('option', null, label); o.value = v; domSel.appendChild(o); });
+        domSel.value = uiState.domain;
+        domSel.onchange = () => { uiState.domain = domSel.value; renderPanel(); };
+        const sortSel = el('select', 'alc-sel');
+        [['count', 'Sort: Count'], ['alpha', 'Sort: A–Z'], ['recent', 'Sort: Recent']]
+            .forEach(([v, label]) => { const o = el('option', null, label); o.value = v; sortSel.appendChild(o); });
+        sortSel.value = uiState.sort;
+        sortSel.onchange = () => { uiState.sort = sortSel.value; renderPanel(); };
+        controls.append(search, domSel, sortSel);
+
+        // buttons
+        const btns = el('div', 'alc-btns');
+        const mkBtn = (txt, cls, fn) => { const b = el('button', 'alc-btn ' + (cls || ''), txt); b.onclick = fn; return b; };
+        btns.append(
+            mkBtn('📋 Copy shown', 'primary', () => { const cur = filteredList(); copyAndToast(cur.join('\n'), `${cur.length} links`); }),
+            mkBtn('📄 This page', '', () => copyAndToast([...currentPageLinks].sort().join('\n'), `${currentPageLinks.size} page links`)),
+            mkBtn('🌐 Network', '', () => copyAndToast([...networkRequests].sort().join('\n'), `${networkRequests.size} requests`)),
+            mkBtn('⬇ JSON', '', exportJson),
+            mkBtn('🗑 Reset', 'danger', resetCollection)
+        );
+
+        const listWrap = el('div', 'alc-list');
+        listWrap.id = PANEL_ID + '-list';
+
+        body.append(stats, controls, btns, listWrap);
+        panel.textContent = '';
+        panel.append(head, body);
+
+        if (firstRender) document.body.appendChild(panel);
+        makeDraggable(panel, head);
+
+        renderListInto(listWrap, list);
+        panel._alcList = listWrap;
+        panel._alcListData = list;
+    }
+
+    function refreshStats() {
+        const panel = document.getElementById(PANEL_ID);
+        if (!panel) return;
+        const domains = domainCounts();
+        const vals = [currentList().length, currentPageLinks.size, networkRequests.size, domains.length];
+        panel.querySelectorAll('.alc-stat b').forEach((b, i) => {
+            if (i < vals.length) b.textContent = String(vals[i]);
+        });
+        // The list-only repaint path skips renderPanel(), so the domain dropdown
+        // must be refreshed here or it stays stuck at its initial empty state.
+        const domSel = panel.querySelector('select.alc-sel');
+        if (domSel) {
+            const keep = uiState.domain;
+            domSel.textContent = '';
+            [['', `All domains (${domains.length})`], ...domains.map(([d, c]) => [d, `${d} (${c})`])]
+                .forEach(([v, label]) => { const o = el('option', null, label); o.value = v; domSel.appendChild(o); });
+            domSel.value = keep;
+        }
+    }
+
+    function renderList() {
+        const panel = document.getElementById(PANEL_ID);
+        if (!panel || !panel._alcList) return;
+        const list = filteredList();
+        panel._alcListData = list;
+        renderListInto(panel._alcList, list);
+    }
+
+    function renderListInto(container, list) {
+        // Preserve scroll position across the clear-and-rebuild; clearing a
+        // scroll container resets scrollTop to 0.
+        const prevScroll = container.scrollTop;
+        container.textContent = '';
+        if (!list.length) {
+            container.appendChild(el('div', 'alc-empty',
+                currentList().length ? 'No links match the filter.' : 'No links collected yet. Browse the page.'));
+            return;
+        }
+        const shown = list.slice(0, 300);
+        shown.forEach(url => {
+            const row = el('div', 'alc-row');
+            const u = el('span', 'alc-url', url);
+            const badge = el('span', 'alc-badge', `×${allLinks[url].count || 1}`);
+            const copy = el('button', 'alc-copy', '⧉');
+            copy.title = 'Copy this link';
+            copy.onclick = () => copyAndToast(url, 'link');
+            row.append(u, badge, copy);
+            container.appendChild(row);
+        });
+        if (list.length > shown.length) {
+            container.appendChild(el('div', 'alc-empty', `…and ${list.length - shown.length} more (refine the filter)`));
+        }
+        container.scrollTop = prevScroll;   // restore after repaint
+    }
+
+    function exportJson() {
+        const data = {exportedAt: new Date().toISOString(), page: location.href,
+            total: currentList().length, links: allLinks};
+        const blob = new Blob([JSON.stringify(data, null, 2)], {type: 'application/json'});
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `links-${location.hostname}-${Date.now()}.json`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    }
+
+    function resetCollection() {
+        if (!confirm('Reset all collected links?')) return;
+        allLinks = {};
+        currentPageLinks.clear();
+        networkRequests.clear();
+        GM_setValue(STORAGE_KEY, {});
+        renderPanel();
+        toast('Collection reset');
+    }
+
+    function makeDraggable(element, handle) {
+        let sx = 0, sy = 0, ox = 0, oy = 0, dragging = false;
+        handle.addEventListener('mousedown', e => {
+            if (e.target.closest('button')) return;   // don't drag from buttons
+            dragging = true;
+            sx = e.clientX; sy = e.clientY;
+            const r = element.getBoundingClientRect();
+            ox = r.left; oy = r.top;
+            element.style.right = 'auto';
+            element.style.left = ox + 'px';
+            element.style.top = oy + 'px';
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp);
+            e.preventDefault();
+        });
+        function onMove(e) {
+            if (!dragging) return;
+            element.style.left = (ox + e.clientX - sx) + 'px';
+            element.style.top = (oy + e.clientY - sy) + 'px';
+        }
+        function onUp() {
+            dragging = false;
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup', onUp);
+        }
+    }
+
+    // ── Init ────────────────────────────────────────────────────────────────
+    function init() {
+        setupNetworkMonitoring();
+
+        const boot = () => {
+            renderPanel();
+            setTimeout(extractAllLinks, 1500);
+        };
+        if (document.body) boot();
+        else document.addEventListener('DOMContentLoaded', boot);
+
+        // Debounced mutation re-scan (was a 1s full re-render storm before).
+        let pending = null;
+        const schedule = () => {
+            if (pending) return;
+            pending = setTimeout(() => { pending = null; extractAllLinks(); }, 1200);
+        };
+        const startObserver = () => {
+            if (!document.body) return;
+            const panelRoot = () => document.getElementById(PANEL_ID);
+            new MutationObserver(mutations => {
+                // Ignore mutations caused by the panel rendering itself, otherwise
+                // render -> mutation -> extract -> render loops forever (and each
+                // pass resets the list scroll).
+                const pr = panelRoot();
+                if (pr && mutations.every(m => pr.contains(m.target))) return;
+                schedule();
+            }).observe(document.body, {
+                childList: true, subtree: true, attributes: true,
+                attributeFilter: ['href', 'src', 'content']
+            });
+        };
+        if (document.body) startObserver();
+        else document.addEventListener('DOMContentLoaded', startObserver);
+
+        GM_registerMenuCommand('📋 Copy all links', () => copyAndToast(currentList().sort().join('\n'), `${currentList().length} links`));
+        GM_registerMenuCommand('📄 Copy this page links', () => copyAndToast([...currentPageLinks].sort().join('\n'), 'page links'));
+        GM_registerMenuCommand('🌐 Copy network requests', () => copyAndToast([...networkRequests].sort().join('\n'), 'network requests'));
+        GM_registerMenuCommand('🔎 Show / hide panel', () => {
+            const p = document.getElementById(PANEL_ID);
+            if (p) p.style.display = p.style.display === 'none' ? 'flex' : 'none';
+            else renderPanel();
+        });
+        GM_registerMenuCommand('🗑 Reset collection', resetCollection);
+    }
+
+    init();
+})();
